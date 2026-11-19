@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Collect human-led Claude Code sessions and condense them for scoring.
+"""Collect human-led coding-agent sessions and condense them for scoring.
 
-Reads main session logs at <claude-dir>/projects/*/*.jsonl. Subagent
-transcripts live in deeper subfolders and are skipped. Standard library only.
+Reads the local session history of Claude Code, Codex CLI, opencode and
+Devin CLI (experimental), whichever are present. Standard library only.
 
   python3 collect.py --survey            # list repeated message prefixes
   python3 collect.py --exclude-prefix "📣 Bot" --sample 20
+  python3 collect.py --source codex      # one tool only
 """
 import argparse
 import collections
@@ -17,181 +18,11 @@ import random
 import re
 import sys
 
-# Messages Claude Code itself writes into the user role. They are never human prompts.
-MACHINE_PREFIXES = (
-    "<task-notification",
-    "<command-message>",
-    "<command-args>",
-    "<local-command-stdout",
-    "<local-command-stderr",
-    "<local-command-caveat",
-    "Caveat: The messages below were generated",
-    "<bash-stdout",
-    "<bash-stderr",
-    "<user-prompt-submit-hook",
-    "This session is being continued from a previous conversation",
+from common import (
+    COMMIT_RE, EDIT_TOOLS, FULL_LIMITS, PASTE_RE, PLAN_TOOLS, SUBAGENT_TOOLS, TEST_RE, TIGHT_LIMITS, TODO_TOOLS,
+    TRANSCRIPT_CAP, block_text, classify_user, clip, default_claude_dir, new_stats, read_entries, summarize_tool,
 )
-REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
-PASTE_RE = re.compile(r"<pasted_content[^>]*>(.*?)</pasted_content[^>]*>", re.S)
-SLASH_NAME_RE = re.compile(r"<command-name>\s*/?([^<\s]+)\s*</command-name>")
-SLASH_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
-BANG_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
-TEST_RE = re.compile(
-    r"\b(pytest|unittest|npm (run )?test|pnpm (run )?test|yarn test|jest|vitest|go test|"
-    r"cargo test|make test|rspec|phpunit|gradlew? \S*test|mvn \S*test|xcodebuild test|"
-    r"tsc|mypy|pyright|ruff|eslint|flake8|pre-commit|playwright test)\b"
-)
-COMMIT_RE = re.compile(r"\bgit (commit|push)\b|\bgh pr (create|merge)\b")
-SUBAGENT_TOOLS = {"Task", "Agent"}
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-PLAN_TOOLS = {"EnterPlanMode", "ExitPlanMode"}
-TODO_TOOLS = {"TodoWrite", "TaskCreate", "TaskUpdate"}
-
-FULL_LIMITS = {"U": 3000, "A": 600, "T": 160, "E": 200, "!": 200, "/": 300}
-TIGHT_LIMITS = {"U": 2000, "A": 200, "T": 90, "E": 100, "!": 120, "/": 200}
-TRANSCRIPT_CAP = 30000
-
-
-def default_claude_dir():
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-
-
-def read_entries(path):
-    """Yield JSON objects from a JSONL file, skipping blank or half-written lines."""
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                yield json.loads(line)
-
-
-def clip(text, limit):
-    """Middle-truncate so both the opening and the ending survive."""
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    head = limit * 2 // 3
-    tail = limit - head
-    return "{} …[{} chars cut]… {}".format(text[:head], len(text) - limit, text[-tail:])
-
-
-def block_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-    return ""
-
-
-def classify_user(content, exclude_prefixes):
-    """Return (kind, text, probe) for one user-role message.
-
-    kind: human | slash | bang | interrupt | automation | machine | tool_result
-    probe: the text used for prefix matching (what --survey reports).
-    """
-    if isinstance(content, list):
-        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            return "tool_result", "", ""
-        parts = []
-        for b in content:
-            if not isinstance(b, dict):
-                continue
-            if b.get("type") == "text":
-                parts.append(b.get("text", ""))
-            elif b.get("type") == "image":
-                parts.append("[image]")
-        text = "\n".join(parts)
-    elif isinstance(content, str):
-        text = content
-    else:
-        return "machine", "", ""
-
-    text = REMINDER_RE.sub("", text).strip()
-    if not text:
-        return "machine", "", ""
-    name = SLASH_NAME_RE.search(text)
-    if name:
-        args = SLASH_ARGS_RE.search(text)
-        arg_text = args.group(1).strip() if args else ""
-        return "slash", "/" + name.group(1) + (" " + arg_text if arg_text else ""), ""
-    if text.startswith("[Request interrupted"):
-        return "interrupt", "", ""
-    if text.startswith("<bash-input>"):
-        bang = BANG_RE.search(text)
-        return "bang", bang.group(1).strip() if bang else text, ""
-    if text.startswith(MACHINE_PREFIXES):
-        return "machine", "", ""
-
-    pastes = PASTE_RE.findall(text)
-    outside = PASTE_RE.sub("", text).strip()
-    probe = (outside or (pastes[0].strip() if pastes else "")).lstrip()
-    if any(probe.startswith(p) for p in exclude_prefixes):
-        return "automation", "", probe
-    if pastes:
-        pasted = sum(len(p) for p in pastes)
-        preview = clip(pastes[0], 400)
-        text = (outside + "\n" if outside else "") + "[PASTED {} chars] {}".format(pasted, preview)
-    return "human", text, probe
-
-
-def summarize_tool(name, inp):
-    if not isinstance(inp, dict):
-        return name
-    if name == "Bash":
-        return "Bash: " + str(inp.get("command", ""))
-    if name in EDIT_TOOLS or name == "Read":
-        return "{}: {}".format(name, inp.get("file_path") or inp.get("notebook_path") or "")
-    if name in ("Grep", "Glob"):
-        return "{}: {}".format(name, inp.get("pattern", ""))
-    if name in SUBAGENT_TOOLS:
-        return "{}: [{} model={}] {}".format(
-            name, inp.get("subagent_type", "-"), inp.get("model", "-"), inp.get("description", "")
-        )
-    if name == "Skill":
-        return "Skill: {} {}".format(inp.get("skill", ""), inp.get("args", "") or "")
-    if name == "WebSearch":
-        return "WebSearch: " + str(inp.get("query", ""))
-    if name == "WebFetch":
-        return "WebFetch: " + str(inp.get("url", ""))
-    return "{}: {}".format(name, json.dumps(inp, ensure_ascii=False)[:150])
-
-
-def new_stats(path):
-    return {
-        "id": os.path.splitext(os.path.basename(path))[0],
-        "path": path,
-        "session_key": None,
-        "human_uuids": [],
-        "project_dir": os.path.basename(os.path.dirname(path)),
-        "cwd": None,
-        "branch": None,
-        "entrypoint": None,
-        "start": None,
-        "end": None,
-        "models": set(),
-        "human_turns": 0,
-        "human_chars": 0,
-        "pasted_chars": 0,
-        "automation_msgs": 0,
-        "interrupts": 0,
-        "bang_cmds": 0,
-        "slash_cmds": collections.Counter(),
-        "compactions": 0,
-        "tool_calls": 0,
-        "human_tool_calls": 0,
-        "tools": collections.Counter(),
-        "tool_errors": 0,
-        "edit_calls": 0,
-        "subagent_calls": 0,
-        "skill_calls": 0,
-        "mcp_calls": 0,
-        "mcp_servers": set(),
-        "parallel_batches": 0,
-        "test_runs": 0,
-        "commits": 0,
-        "plan_mode_calls": 0,
-        "todo_calls": 0,
-    }
+import sources
 
 
 def parse_session(path, exclude_prefixes, probes=None):
@@ -295,7 +126,25 @@ def parse_session(path, exclude_prefixes, probes=None):
                         s["commits"] += 1
                 lines.append(("T", summarize_tool(name, inp)))
     s["parallel_batches"] = sum(1 for n in tool_uses_per_message.values() if n >= 2)
+    s["headless"] = (s["entrypoint"] or "").startswith("sdk")
     return s, lines
+
+
+def discover(claude_dir, days, source):
+    """List session refs of every requested tool that has history on this machine."""
+    refs = []
+    if source in ("all", "claude"):
+        refs += [{"source": "claude", "path": f} for f in session_files(os.path.join(claude_dir, "projects"), days)]
+    for name, (list_refs, _) in sources.READERS.items():
+        if source in ("all", name):
+            refs += list_refs(days)
+    return refs
+
+
+def parse_ref(ref, exclude_prefixes, probes=None):
+    if ref["source"] == "claude":
+        return parse_session(ref["path"], exclude_prefixes, probes)
+    return sources.READERS[ref["source"]][1](ref, exclude_prefixes, probes)
 
 
 def to_local(ts):
@@ -309,11 +158,11 @@ def render(s, lines):
     start, end = to_local(s["start"]), to_local(s["end"])
     minutes = int((end - start).total_seconds() // 60) if start and end else 0
     header = (
-        "# session {id}\nproject: {proj}\ncwd: {cwd}\nstart: {start}  duration: {mins}m\n"
+        "# session {id}\ntool: {tool}\nproject: {proj}\ncwd: {cwd}\nstart: {start}  duration: {mins}m\n"
         "human turns: {ht}  tool calls: {tc}  subagents: {sa}  skills: {sk}  tests: {te}  commits: {co}\n"
         "models: {models}\n\n"
     ).format(
-        id=s["id"], proj=s["project_dir"], cwd=s["cwd"],
+        id=s["id"], tool=s["source"], proj=s["project_dir"], cwd=s["cwd"],
         start=start.strftime("%Y-%m-%d %H:%M %Z") if start else "-", mins=minutes,
         ht=s["human_turns"], tc=s["tool_calls"], sa=s["subagent_calls"], sk=s["skill_calls"],
         te=s["test_runs"], co=s["commits"], models=", ".join(sorted(s["models"])) or "-",
@@ -376,15 +225,15 @@ def session_files(projects_dir, days):
     return sorted(f for f in files if os.path.getmtime(f) >= cutoff)
 
 
-def survey(files, exclude_prefixes, top):
+def survey(refs, exclude_prefixes, top):
     stats, probes_by_session = [], {}
-    for f in files:
+    for ref in refs:
         probes = []
-        s, _ = parse_session(f, exclude_prefixes, probes)
+        s, _ = parse_ref(ref, exclude_prefixes, probes)
         stats.append(s)
         probes_by_session[s["id"]] = probes
     kept, dropped = dedupe(stats)
-    entrypoints = collections.Counter(s["entrypoint"] for s in kept)
+    entrypoints = collections.Counter("{}:{}".format(s["source"], s["entrypoint"]) for s in kept)
     counts = collections.Counter()
     sessions = collections.defaultdict(set)
     for s in kept:
@@ -393,7 +242,8 @@ def survey(files, exclude_prefixes, top):
             counts[key] += 1
             sessions[key].add(s["id"])
     total = sum(counts.values())
-    print("scanned session files: {} ({} duplicate copies dropped)".format(len(files), dropped))
+    print("scanned sessions: {} ({} duplicate copies dropped)".format(len(refs), dropped))
+    print("by tool: {}".format(dict(collections.Counter(s["source"] for s in kept))))
     print("entrypoints: {}".format(dict(entrypoints)))
     print("candidate human messages: {}".format(total))
     print("\nmost repeated message prefixes (count / sessions / prefix):")
@@ -424,6 +274,8 @@ def pick_sample(eligible, n, per_project_cap, seed):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--claude-dir", default=default_claude_dir())
+    ap.add_argument("--source", choices=("all", "claude") + tuple(sources.READERS), default="all",
+                    help="which tool's history to read (default: every tool found)")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--survey", action="store_true", help="print repeated message prefixes and exit")
     ap.add_argument("--top", type=int, default=30)
@@ -434,31 +286,33 @@ def main(argv=None):
     ap.add_argument("--per-project", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--include-sdk", action="store_true", help="keep headless (claude -p / SDK) sessions")
-    ap.add_argument("--out", help="output dir (default <claude-dir>/usage-data/agentic-eng-score/<stamp>)")
+    ap.add_argument("--include-sdk", action="store_true", help="keep headless (SDK, exec, subagent) sessions")
+    ap.add_argument("--out", help="output dir (default ~/.agentic-eng-score/runs/<stamp>)")
     args = ap.parse_args(argv)
 
     prefixes = list(args.exclude_prefix)
     if args.exclude_file:
         with open(args.exclude_file, encoding="utf-8") as fh:
             prefixes += [ln.rstrip("\n") for ln in fh if ln.strip()]
-    projects_dir = os.path.join(args.claude_dir, "projects")
-    files = session_files(projects_dir, args.days)
+    files = discover(args.claude_dir, args.days, args.source)
+    unreadable = sources.codex_unreadable(args.days) if args.source in ("all", "codex") else 0
+    if unreadable:
+        print("note: {} compressed Codex sessions skipped; install zstd or use Python 3.14+ to read them".format(unreadable))
     if not files:
-        print("no session files under {} in the last {} days".format(projects_dir, args.days))
+        print("no sessions found in the last {} days (source: {})".format(args.days, args.source))
         return 1
     if args.survey:
         survey(files, prefixes, args.top)
         return 0
 
-    stats = [parse_session(f, prefixes)[0] for f in files]
+    stats = [parse_ref(ref, prefixes)[0] for ref in files]
     unique, dropped = dedupe(stats)
     eligible = []
     skipped = collections.Counter()
     if dropped:
         skipped["duplicate_copy"] = dropped
     for s in unique:
-        if not args.include_sdk and (s["entrypoint"] or "").startswith("sdk"):
+        if not args.include_sdk and s["headless"]:
             skipped["headless"] += 1
         elif s["human_turns"] < args.min_turns:
             skipped["few_human_turns"] += 1
@@ -470,12 +324,12 @@ def main(argv=None):
     picked = pick_sample(eligible, args.sample, args.per_project, args.seed)
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = args.out or os.path.join(args.claude_dir, "usage-data", "agentic-eng-score", stamp)
+    out = args.out or os.path.join(os.path.expanduser("~"), ".agentic-eng-score", "runs", stamp)
     os.makedirs(os.path.join(out, "transcripts"), exist_ok=True)
     os.makedirs(os.path.join(out, "scores"), exist_ok=True)
     sessions = []
     for picked_stats in picked:
-        s, lines = parse_session(picked_stats["path"], prefixes)
+        s, lines = parse_ref(picked_stats["ref"], prefixes)
         rel = os.path.join("transcripts", s["id"] + ".txt")
         with open(os.path.join(out, rel), "w", encoding="utf-8") as fh:
             fh.write(render(s, lines))
@@ -490,17 +344,21 @@ def main(argv=None):
         "params": {
             "days": args.days, "min_turns": args.min_turns, "sample": args.sample,
             "per_project": args.per_project, "seed": args.seed, "include_sdk": args.include_sdk,
+            "source": args.source,
             "exclude_prefixes": prefixes,
         },
-        "counts": {"files": len(files), "eligible": len(eligible), "picked": len(sessions), "skipped": dict(skipped)},
+        "counts": {"files": len(files), "eligible": len(eligible), "picked": len(sessions), "skipped": dict(skipped),
+                   "eligible_by_tool": dict(collections.Counter(s["source"] for s in eligible)),
+                   "picked_by_tool": dict(collections.Counter(r["source"] for r in sessions))},
         "batches": batches,
         "sessions": sessions,
     }
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
     print("out: {}".format(out))
-    print("files {} → eligible {} → picked {} (skipped {})".format(
+    print("sessions {} → eligible {} → picked {} (skipped {})".format(
         len(files), len(eligible), len(sessions), dict(skipped)))
+    print("picked by tool: {}".format(manifest["counts"]["picked_by_tool"]))
     for i, b in enumerate(batches, 1):
         print("batch {}: {}".format(i, " ".join(b)))
     return 0

@@ -28,8 +28,8 @@ DIM_KO = {"clarity": "명확성", "specificity": "구체성", "actionability": "
 
 # Setup checklist for the context axis: (key, label, points)
 CHECKLIST = (
-    ("global_md", "전역 CLAUDE.md 있음", 10),
-    ("global_md_rich", "전역 CLAUDE.md 30줄 이상", 5),
+    ("global_md", "전역 지시 파일(CLAUDE.md·AGENTS.md) 있음", 10),
+    ("global_md_rich", "전역 지시 파일 30줄 이상", 5),
     ("project_md", "작업한 프로젝트의 절반 이상에 CLAUDE.md/AGENTS.md", 15),
     ("skills", "직접 만든 스킬 1개 이상", 10),
     ("skills_many", "직접 만든 스킬 5개 이상", 5),
@@ -356,12 +356,14 @@ def render(manifest, r, problems):
         out.append("| {} | {} | {} | {} |".format(label, "✅" if ok else "—", pts if ok else 0, detail))
     out.append("")
     out.append("## 세션별 점수\n")
+    out.append("도구별 세션 수: {}\n".format(", ".join("{} {}".format(k, v) for k, v in sorted(
+        collections.Counter(s.get("source", "claude") for s in r["rows"]).items()))))
     out.append("작업 유형 분포: {}\n".format(", ".join("{} {}".format(k, v) for k, v in r["work_modes"].items())))
-    out.append("| 시작 | 프로젝트 | 유형 | 숙련 | 통한 지시 | 맥락 | 위임 | 결과 | 사람 발화 | 도구 |")
-    out.append("|---|---|---|:---:|:---:|:---:|:---:|---|---:|---:|")
+    out.append("| 시작 | 도구 | 프로젝트 | 유형 | 숙련 | 통한 지시 | 맥락 | 위임 | 결과 | 사람 발화 | 도구 호출 |")
+    out.append("|---|---|---|---|:---:|:---:|:---:|:---:|---|---:|---:|")
     for s, x in zip(r["rows"], r["scores"]):
-        out.append("| {} | {} | {} | {} | {} | {:g} | {:g} | {}{} | {} | {} |".format(
-            (s.get("start") or "")[:10], project_name(s), x["work_mode"], x["expertise"],
+        out.append("| {} | {} | {} | {} | {} | {} | {:g} | {:g} | {}{} | {} | {} |".format(
+            (s.get("start") or "")[:10], s.get("source", "claude"), project_name(s), x["work_mode"], x["expertise"],
             "{}/{}".format(x["prompt"]["instructions"] - len(x["prompt"]["misses"]), x["prompt"]["instructions"]),
             x["context"]["score"], x["agentic"]["score"],
             x["outcome"], " ✔" if x["hard_signal"] else "", s["human_turns"], s["tool_calls"]))

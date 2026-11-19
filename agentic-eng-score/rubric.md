@@ -1,5 +1,7 @@
 # 세션 채점 기준
 
+transcript 헤더의 `tool:` 줄은 그 세션을 돌린 코딩 에이전트(claude, codex, opencode, devin)다. 채점 기준은 도구와 무관하게 같다. 도구마다 도구 이름이 다르다(셸은 `Bash`·`shell`·`bash`·`execute`, 편집은 `Edit`·`apply_patch`·`edit`). `tool: devin` 세션은 도구 호출에 시각 정보가 없어 대화 뒤에 몰아서 적혀 있다. 순서로 판단하지 마라.
+
 채점 대상은 **사용자(사람)**다. Claude가 얼마나 잘했는지, 작업이 얼마나 어려웠는지는 점수에 넣지 않는다. 이 세션에서 사용자가 보여 준 지시, 맥락 제공, 위임 방식만 본다.
 
 ## transcript 읽는 법

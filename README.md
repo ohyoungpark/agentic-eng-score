@@ -1,17 +1,20 @@
 # agentic-eng-score
 
-A Claude Code skill that scores **your own** prompt engineering, context engineering, and agentic engineering from your local Claude Code session history. Everything runs on your machine. The skill instructions and the report are written in Korean.
+An agent skill that scores **your own** prompt engineering, context engineering, and agentic engineering from your local coding-agent session history: Claude Code, Codex CLI, opencode, and Devin CLI (experimental). Everything runs on your machine. The skill instructions and the report are written in Korean.
 
-Claude Code 세션 기록으로 **Prompt Engineering · Context Engineering · Agentic Engineering** 세 축을 0–100점, L1–L5로 매기는 스킬이다. 기록은 머신 밖으로 나가지 않는다.
+코딩 에이전트 세션 기록으로 **Prompt Engineering · Context Engineering · Agentic Engineering** 세 축을 0–100점, L1–L5로 매기는 스킬이다. Claude Code, Codex CLI, opencode, Devin CLI(실험적)의 기록을 읽는다. 기록은 머신 밖으로 나가지 않는다.
 
 ## 설치
 
 ```bash
 git clone https://github.com/ohyoungpark/agentic-eng-score.git
+# Claude Code
 cp -r agentic-eng-score/agentic-eng-score ~/.claude/skills/
+# Codex CLI, opencode, Devin CLI
+mkdir -p ~/.agents/skills && cp -r agentic-eng-score/agentic-eng-score ~/.agents/skills/
 ```
 
-`~/.claude/skills/agentic-eng-score/SKILL.md`가 생기면 된다. Claude Code를 새로 열고 이렇게 말한다.
+해당 폴더에 `agentic-eng-score/SKILL.md`가 생기면 된다. `~/.agents/skills`는 Codex CLI, opencode, Devin CLI가 함께 읽는 경로이고, opencode는 `~/.claude/skills`도 읽는다. 에이전트를 새로 열고 이렇게 말한다.
 
 > 내 에이전틱 엔지니어링 점수 매겨줘
 
@@ -29,6 +32,17 @@ cp -r agentic-eng-score/agentic-eng-score ~/.claude/skills/
 
 리포트에는 이 표와 함께 Anthropic 연구 집계와의 비교, 설정 점검표, 세션별 점수, 한 번에 통하지 않은 지시 목록과 원문 인용, 강점 3개와 다음에 바꿀 행동 3개가 들어간다.
 
+## 읽는 기록
+
+| 도구 | 기록 위치 | 상태 |
+|---|---|---|
+| Claude Code | `~/.claude/projects/*/*.jsonl` | 실제 기록으로 검증 |
+| Codex CLI | `~/.codex/sessions/**/rollout-*.jsonl[.zst]` | 실제 기록으로 검증. `.zst`는 Python 3.14+ 또는 `zstd` 명령이 있어야 읽는다 |
+| opencode | `~/.local/share/opencode/opencode.db` (SQLite) | 실제 기록으로 검증 |
+| Devin CLI | `~/.local/share/devin/cli/sessions.db` (SQLite) | **실험적.** 비공식 스키마 문서를 보고 썼고 실제 기록으로 돌려 보지 못했다 |
+
+있는 기록만 알아서 읽고, 리포트의 세션 표에 도구를 표시한다. 한 도구만 보려면 "Codex 세션만 채점해줘"라고 하면 된다. Devin의 클라우드 세션(웹)은 로컬에 기록이 없어 읽지 못한다. Devin CLI는 에이전트 답변의 저장 형식이 공개돼 있지 않아 사람 프롬프트와 도구 호출 위주로 읽고, 도구 호출의 순서도 알 수 없다.
+
 ## 무엇을 보나
 
 | 축 | 근거 |
@@ -41,8 +55,8 @@ Anthropic의 세션 숙련도 5단계 분류도 함께 매기고, Anthropic 연�
 
 ## 동작
 
-1. `collect.py`가 `~/.claude/projects/*/*.jsonl`에서 **사람이 이끈 세션**만 고른다.
-   - headless(`claude -p`·SDK) 세션, 사람 발화가 3회 미만인 세션, 동기화 충돌·fork로 생긴 중복 사본은 뺀다.
+1. `collect.py`가 이 머신에 있는 도구들의 세션 기록에서 **사람이 이끈 세션**만 고른다.
+   - headless 세션(`claude -p`, SDK, `codex exec`, 서브에이전트 세션), 다른 도구에서 가져온 사본, 사람 발화가 3회 미만인 세션, 동기화 충돌·fork로 생긴 중복 사본은 뺀다.
    - 봇·오케스트레이터가 사용자 역할로 넣은 메시지는 `--survey`로 반복 머리말을 찾아 제외한다.
 2. 고른 세션마다 사람 발화를 중심으로 transcript를 3만 자 이내로 줄인다.
 3. `context_audit.py`가 설정 파일의 **이름과 개수만** 센다. 설정값(토큰·env)은 읽어 오지 않는다.
@@ -53,7 +67,7 @@ Anthropic의 세션 숙련도 5단계 분류도 함께 매기고, Anthropic 연�
 
 기본은 세션당 한 번 채점이다. "두 번 채점해줘"라고 하면 독립된 채점자 둘이 같은 세션을 따로 채점하고, 숫자 점수는 평균하고, 통하지 않은 지시는 둘 다 같은 발화를 짚었을 때만 세고, 성공 여부는 낮은 쪽을 따른다. 비용은 두 배다. 20세션으로 두 번 채점해 비교했을 때 두 채점의 축 점수 차이는 1.3점 이내였고, 세션 단위로는 20개 중 6개에서 맥락 점수가 한 칸씩 갈렸다. 그래서 표본이 10세션 미만일 때만 스킬이 알아서 두 번 채점한다.
 
-결과는 `~/.claude/usage-data/agentic-eng-score/<시각>/`에 남는다. transcript에는 비밀값이 섞여 있을 수 있으므로 이 폴더를 그대로 공유하지 말고, 공유할 때는 `report.md`의 점수 표만 옮긴다.
+결과는 `~/.agentic-eng-score/runs/<시각>/`에 남는다. transcript에는 비밀값이 섞여 있을 수 있으므로 이 폴더를 그대로 공유하지 말고, 공유할 때는 `report.md`의 점수 표만 옮긴다.
 
 스크립트는 스킬 없이도 쓸 수 있다.
 
@@ -64,9 +78,9 @@ python3 agentic-eng-score/scripts/collect.py --help
 
 ## 요구 사항
 
-- Claude Code (서브에이전트 사용 가능 권장)
+- Claude Code, Codex CLI, opencode, Devin CLI 가운데 하나 (서브에이전트를 쓸 수 있으면 채점이 빠르다)
 - Python 3.9 이상, 표준 라이브러리만 사용
-- macOS에서 확인했다(Python 3.9, 3.14). 테스트는 CI에서 Linux로도 돈다. Windows는 확인하지 않았다.
+- macOS에서 확인했다(Python 3.9, 3.14). 테스트는 CI에서 Linux로도 돈다. Windows는 확인하지 않았다. 스킬 전체 절차를 끝까지 돌려 본 것은 Claude Code에서뿐이다. 다른 도구에서는 수집·채점·합산 스크립트가 그 도구의 기록을 읽는 것까지 확인했다.
 
 ## 개발
 
@@ -80,6 +94,8 @@ python3 -m unittest discover -s tests -v
   - https://www.anthropic.com/research/claude-code-expertise
 - 프롬프트 네 항목(Clarity·Specificity·Actionability·Scope)은 Claude Code Prompt Coach 스킬의 구성을 따랐다.
   - https://github.com/hancengiz/claude-code-prompt-coach-skill
+- Devin CLI의 로컬 저장 구조는 비공식 문서를 참고했다.
+  - https://github.com/Icaro0310/devin-internals-spec
 
 ## 한계
 
@@ -90,6 +106,7 @@ python3 -m unittest discover -s tests -v
 - 다른 세션이나 스크립트가 틀 없이 넣은 첫 메시지는 사람 발화와 구분하지 못한다.
 - 이 머신에 남아 있는 기록만 본다. claude.ai 웹에서 한 작업은 들어가지 않는다.
 - 채용·인사 평가 용도로 만들지 않았다. 자기 점검용이다.
+- 기록 형식은 도구가 업데이트되면 바뀐다. Codex는 2026-05~11 기록, opencode는 2026-08 기록의 형식에 맞췄다.
 
 ## License
 
