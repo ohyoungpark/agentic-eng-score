@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Validate per-session scores and write report.md + summary.json.
 
-  python3 aggregate.py <out-dir>              # two scoring passes per session
-  python3 aggregate.py <out-dir> --passes 1   # single pass
+  python3 aggregate.py <out-dir>
 
-Pass 1 is scores/<id>.json, pass 2 is scores/<id>.b.json. With two passes a
-missed instruction counts only when both passes flagged the same turn, and
-numeric scores are averaged.
+Pass 1 is scores/<id>.json. If any scores/<id>.b.json exists the run is
+treated as two-pass (override with --passes): a missed instruction counts
+only when both passes flagged the same turn, and numeric scores are averaged.
 
 Exit code 2 when a sampled session has no valid score file yet; the list of
 missing or invalid ids is printed so they can be re-scored.
 """
 import argparse
 import collections
+import glob
 import json
 import os
 import re
@@ -393,8 +393,10 @@ def render(manifest, r, problems):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir")
-    ap.add_argument("--passes", type=int, choices=(1, 2), default=2)
+    ap.add_argument("--passes", type=int, choices=(1, 2), help="default: 2 if any <id>.b.json exists, else 1")
     args = ap.parse_args(argv)
+    if args.passes is None:
+        args.passes = 2 if glob.glob(os.path.join(args.out_dir, "scores", "*.b.json")) else 1
     with open(os.path.join(args.out_dir, "manifest.json"), encoding="utf-8") as fh:
         manifest = json.load(fh)
     with open(os.path.join(args.out_dir, "context_audit.json"), encoding="utf-8") as fh:

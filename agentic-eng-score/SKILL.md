@@ -45,9 +45,9 @@ eligible이 5개 미만이면 `--days 90`이나 `--min-turns 2`로 넓히고, �
 python3 "<skill-dir>/scripts/context_audit.py" "<out-dir>"
 ```
 
-### 4. 세션 채점 — 묶음마다 서브에이전트 둘, 한 메시지에서 병렬로
+### 4. 세션 채점 — 묶음마다 서브에이전트 하나, 한 메시지에서 병렬로
 
-채점자 한 명의 판단은 흔들린다. 그래서 묶음마다 서로 독립된 `general-purpose` 서브에이전트(`model: sonnet`)를 **둘** 띄운다. 첫 번째는 `<session_id>.json`에, 두 번째는 `<session_id>.b.json`에 저장한다. 묶음이 4개면 서브에이전트는 8개이고, 모두 한 메시지 안에서 동시에 호출한다. 지시문은 아래 형식을 그대로 쓰고, 꺾쇠 안만 채운다. `<suffix>`는 첫 번째 채점자에게는 빈 문자열, 두 번째 채점자에게는 `.b`다.
+묶음마다 `general-purpose` 서브에이전트를 `model: sonnet`으로 하나씩 띄운다. 모두 한 메시지 안에서 동시에 호출한다. 지시문은 아래 형식을 그대로 쓰고, 꺾쇠 안만 채운다. `<suffix>`는 빈 문자열이다.
 
 ```text
 너는 Claude Code 세션 채점자다. 먼저 <skill-dir>/rubric.md 를 끝까지 읽어라.
@@ -62,7 +62,9 @@ scores 폴더에 이미 있는 다른 파일은 읽지 마라.
 다 저장했으면 "scored: <id 목록>" 한 줄만 답하라.
 ```
 
-서브에이전트를 쓸 수 없는 환경이면 같은 지시를 직접 한 번 수행하고, 5단계에서 `--passes 1`을 붙인다. 사용자가 빨리 보고 싶다고 하면 채점자를 묶음당 하나만 띄우고 `--passes 1`로 합산해도 된다. 이때는 점수가 한 번의 채점이라는 점을 보고에 적는다.
+서브에이전트를 쓸 수 없는 환경이면 같은 지시를 직접 수행한다.
+
+**두 번 채점하는 경우.** 표본이 10세션 미만이거나 사용자가 "두 번 채점해줘"라고 하면, 묶음마다 서로 독립된 서브에이전트를 하나 더 띄우고 그쪽 지시문의 `<suffix>`를 `.b`로 한다. 표본이 작으면 한 세션의 판단 차이가 축 점수를 몇 점씩 움직이기 때문이다. 합산 스크립트는 `.b.json` 파일이 있으면 두 채점을 알아서 합친다.
 
 ### 5. 합산
 
@@ -89,7 +91,7 @@ python3 "<skill-dir>/scripts/aggregate.py" "<out-dir>"
 | 조사 | `collect.py --survey` | 반복 머리말 목록 |
 | 수집 | `collect.py --exclude-prefix …` | `manifest.json`, `transcripts/*.txt` |
 | 점검 | `context_audit.py <out-dir>` | `context_audit.json` |
-| 채점 | 서브에이전트 (sonnet) × 2 | `scores/<id>.json`, `scores/<id>.b.json` |
+| 채점 | 서브에이전트 (sonnet) | `scores/<id>.json` (두 번 채점하면 `<id>.b.json` 추가) |
 | 합산 | `aggregate.py <out-dir>` | `report.md`, `summary.json` |
 
 ## 흔한 실수

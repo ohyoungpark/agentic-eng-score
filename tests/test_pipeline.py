@@ -187,7 +187,7 @@ class PipelineTest(unittest.TestCase):
         with open(os.path.join(self.out, "scores", "main.json"), "w") as fh:
             json.dump(score, fh)
         with redirect_stdout(io.StringIO()):
-            rc = aggregate.main([self.out, "--passes", "1"])
+            rc = aggregate.main([self.out])  # no .b.json yet: single pass
         self.assertEqual(rc, 0)
         with open(os.path.join(self.out, "summary.json")) as fh:
             summary = json.load(fh)
@@ -245,6 +245,10 @@ class PipelineTest(unittest.TestCase):
             rc = aggregate.main([self.out])
         self.assertEqual(rc, 2)
         self.assertIn("needs rescoring: main.json", buf.getvalue())
+        self.assertNotIn("main.b.json", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            aggregate.main([self.out, "--passes", "2"])
         self.assertIn("needs rescoring: main.b.json (missing)", buf.getvalue())
         errs = aggregate.validate({"session_id": "main", "expertise": 6, "hard_signal": "yes"}, "main")
         self.assertIn("expertise", errs)
