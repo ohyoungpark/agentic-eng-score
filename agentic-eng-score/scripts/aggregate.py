@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Validate per-session scores and write report.md + summary.json.
 
-  python3 aggregate.py <out-dir>
+  python3 aggregate.py <out-dir>              # two scoring passes per session
+  python3 aggregate.py <out-dir> --passes 1   # single pass
+
+Pass 1 is scores/<id>.json, pass 2 is scores/<id>.b.json. With two passes a
+missed instruction counts only when both passes flagged the same turn, and
+numeric scores are averaged.
 
 Exit code 2 when a sampled session has no valid score file yet; the list of
 missing or invalid ids is printed so they can be re-scored.
@@ -17,6 +22,8 @@ WORK_MODES = {"Plan", "Build", "Fix", "Understand", "Test", "Operate", "Analyze"
 OUTCOMES = {"Succeeded", "Partial", "Failed", "No clear goal"}
 SHARES = {"most", "half", "few"}
 PROMPT_DIMS = ("clarity", "specificity", "actionability", "scope")
+MISS_KINDS = {"clarify", "misread"}
+MISS_KO = {"clarify": "되물음", "misread": "오해"}
 DIM_KO = {"clarity": "명확성", "specificity": "구체성", "actionability": "실행 가능성", "scope": "범위"}
 
 # Setup checklist for the context axis: (key, label, points)
@@ -52,6 +59,14 @@ def validate(sc, sid):
     for d in PROMPT_DIMS:
         if not is_int_in(prompt.get(d), 0, 10):
             errs.append("prompt." + d)
+    misses = prompt.get("misses")
+    if not is_int_in(prompt.get("instructions"), 1, 100000):
+        errs.append("prompt.instructions")
+    elif not isinstance(misses, list) or len(misses) > prompt["instructions"]:
+        errs.append("prompt.misses")
+    elif not all(isinstance(m, dict) and m.get("kind") in MISS_KINDS and isinstance(m.get("evidence"), str)
+                 and re.match(r"U\d+$", str(m.get("turn", ""))) for m in misses):
+        errs.append("prompt.misses item")
     for axis in ("context", "agentic"):
         block = sc.get(axis) if isinstance(sc.get(axis), dict) else {}
         if not is_int_in(block.get("score"), 1, 5):
@@ -63,10 +78,19 @@ def validate(sc, sid):
         errs.append("outcome")
     if not isinstance(sc.get("hard_signal"), bool):
         errs.append("hard_signal")
+    elif sc["hard_signal"] and not str(sc.get("hard_signal_evidence") or "").strip():
+        errs.append("hard_signal_evidence")
     return errs
 
 
 QUOTE_RE = re.compile(r'U\d+:\s*"([^"]+)"')
+TAG_PREFIX_RE = re.compile(r'^\s*(\[[^\]]{1,5}\]|[UATE]\d*:)\s*')
+
+
+def probe_of(quote):
+    """First 20 characters of a quote, without a leading line tag or quote marks."""
+    bare = TAG_PREFIX_RE.sub("", quote).strip().strip('"').rstrip(".…").strip()
+    return bare[:20]
 
 
 def unverified_quotes(sc, transcript):
@@ -78,31 +102,79 @@ def unverified_quotes(sc, transcript):
             probe = quote.strip().rstrip(".…").strip()[:20]
             if probe and probe not in transcript:
                 missing.append(quote)
+    prompt = sc.get("prompt") if isinstance(sc.get("prompt"), dict) else {}
+    for miss in prompt.get("misses") or []:
+        quote = miss.get("evidence", "") if isinstance(miss, dict) else ""
+        probe = probe_of(quote)
+        if not probe or probe not in transcript:
+            missing.append(quote or "(empty miss evidence)")
+    if sc.get("hard_signal") is True:
+        quote = str(sc.get("hard_signal_evidence") or "")
+        probe = probe_of(quote)
+        if probe and probe not in transcript:
+            missing.append(quote)
     return missing
 
 
-def load_scores(out_dir, sessions):
+OUTCOME_RANK = {"Succeeded": 3, "Partial": 2, "Failed": 1, "No clear goal": 0}
+
+
+def merge(passes):
+    """Combine scoring passes of one session into one conservative score."""
+    a = passes[0]
+    if len(passes) == 1:
+        return a
+    turns_everywhere = set.intersection(*[{m["turn"] for m in p["prompt"]["misses"]} for p in passes])
+    misses = [m for m in a["prompt"]["misses"] if m["turn"] in turns_everywhere]
+    prompt = {d: mean(p["prompt"][d] for p in passes) for d in PROMPT_DIMS}
+    prompt["misses"] = misses
+    prompt["instructions"] = max(int(mean(p["prompt"]["instructions"] for p in passes) + 0.5), len(misses), 1)
+    rated = [p["expertise"] for p in passes if p["expertise"] != "Unclear"]
+    goals = [p["outcome"] for p in passes if p["outcome"] != "No clear goal"]
+    out = dict(a)
+    out["prompt"] = prompt
+    out["context"] = dict(a["context"], score=mean(p["context"]["score"] for p in passes))
+    out["agentic"] = dict(a["agentic"], score=mean(p["agentic"]["score"] for p in passes))
+    out["expertise"] = int(mean(rated) + 0.5) if rated else "Unclear"
+    out["outcome"] = min(goals, key=OUTCOME_RANK.get) if goals else "No clear goal"
+    out["hard_signal"] = all(p["hard_signal"] for p in passes)
+    return out
+
+
+PASS_SUFFIX = ("", ".b")
+
+
+def load_pass(out_dir, s, suffix):
+    """Return (score, errors) for one scoring pass of one session."""
+    path = os.path.join(out_dir, "scores", s["id"] + suffix + ".json")
+    if not os.path.isfile(path):
+        return None, ["missing"]
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().strip()
+    if not text.startswith("{"):
+        return None, ["not a JSON object"]
+    sc = json.loads(text)
+    errs = validate(sc, s["id"])
+    with open(os.path.join(out_dir, s["transcript"]), encoding="utf-8") as fh:
+        missing = unverified_quotes(sc, fh.read())
+    if missing:
+        errs.append("evidence not found in transcript: " + " | ".join(m[:40] for m in missing))
+    return sc, errs
+
+
+def load_scores(out_dir, sessions, passes):
+    """Return ({id: [score per pass]}, {score file name: errors})."""
     scores, problems = {}, {}
     for s in sessions:
-        path = os.path.join(out_dir, "scores", s["id"] + ".json")
-        if not os.path.isfile(path):
-            problems[s["id"]] = ["missing"]
-            continue
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read().strip()
-        if not text.startswith("{"):
-            problems[s["id"]] = ["not a JSON object"]
-            continue
-        sc = json.loads(text)
-        errs = validate(sc, s["id"])
-        with open(os.path.join(out_dir, s["transcript"]), encoding="utf-8") as fh:
-            missing = unverified_quotes(sc, fh.read())
-        if missing:
-            errs.append("evidence not found in transcript: " + " | ".join(m[:40] for m in missing))
-        if errs:
-            problems[s["id"]] = errs
-        else:
-            scores[s["id"]] = sc
+        loaded = []
+        for suffix in PASS_SUFFIX[:passes]:
+            sc, errs = load_pass(out_dir, s, suffix)
+            if errs:
+                problems[s["id"] + suffix + ".json"] = errs
+            else:
+                loaded.append(sc)
+        if len(loaded) == passes:
+            scores[s["id"]] = loaded
     return scores, problems
 
 
@@ -191,21 +263,28 @@ def compute(manifest, audit, scores):
     sc = [scores[s["id"]] for s in rows]
     n = len(sc)
     dims = {d: mean(x["prompt"][d] for x in sc) for d in PROMPT_DIMS}
-    pe = mean(mean(x["prompt"][d] for d in PROMPT_DIMS) for x in sc) * 10
+    form = mean(mean(x["prompt"][d] for d in PROMPT_DIMS) for x in sc) * 10
+    instructions = sum(x["prompt"]["instructions"] for x in sc)
+    miss_kinds = collections.Counter(m["kind"] for x in sc for m in x["prompt"]["misses"])
+    missed = sum(miss_kinds.values())
+    pe = (instructions - missed) / instructions * 100
     ctx_mean = mean(x["context"]["score"] for x in sc)
     setup_points, setup_rows = setup_checks(audit, manifest["sessions"])
     ce = 0.5 * to100(ctx_mean) + 0.5 * setup_points
     ag_mean = mean(x["agentic"]["score"] for x in sc)
     verified = mean(1.0 if (x["outcome"] == "Succeeded" and x["hard_signal"]) else 0.0 for x in sc)
     app = mean(s["actions_per_prompt"] for s in rows)
-    ae = 0.7 * to100(ag_mean) + 0.15 * min(verified / 0.4, 1.0) * 100 + 0.15 * min(app / 12.0, 1.0) * 100
+    ae = 0.8 * to100(ag_mean) + 0.2 * verified * 100
     partial_plus = mean(1.0 if x["outcome"] in ("Succeeded", "Partial") else 0.0 for x in sc)
     abandoned = mean(1.0 if (x["outcome"] == "Failed" and s["edit_calls"] == 0) else 0.0 for x, s in zip(sc, rows))
     expertise = collections.Counter(str(x["expertise"]) for x in sc)
     rated = [x["expertise"] for x in sc if x["expertise"] != "Unclear"]
     return {
         "n": n,
-        "prompt": {"score": round(pe, 1), "level": level(pe), "dims": {d: round(v, 2) for d, v in dims.items()}},
+        "prompt": {"score": round(pe, 1), "level": level(pe), "dims": {d: round(v, 2) for d, v in dims.items()},
+                   "instructions": instructions, "landed": instructions - missed,
+                   "clarify": miss_kinds.get("clarify", 0), "misread": miss_kinds.get("misread", 0),
+                   "form_score": round(form, 1)},
         "context": {"score": round(ce, 1), "level": level(ce), "session_mean": round(ctx_mean, 2),
                     "setup_points": setup_points, "setup_rows": setup_rows},
         "agentic": {"score": round(ae, 1), "level": level(ae), "session_mean": round(ag_mean, 2),
@@ -234,16 +313,25 @@ def render(manifest, r, problems):
     out.append("생성 {} · 채점 세션 {}개 (최근 {}일, 사람 발화 {}회 이상, 표본 seed {})\n".format(
         manifest["generated_at"], r["n"], par["days"], par["min_turns"], par["seed"]))
     if problems:
-        out.append("> ⚠️ 채점이 없거나 형식이 틀린 세션 {}개는 빠졌다: {}\n".format(
+        out.append("> ⚠️ 채점이 없거나 형식이 틀린 파일 {}개가 있어 해당 세션은 빠졌다: {}\n".format(
             len(problems), ", ".join(sorted(problems))))
+    spread = r.get("spread")
+    if spread:
+        out.append("세션마다 두 번 채점했다. 점수는 두 채점을 합친 값이고, 괄호는 각 채점을 따로 계산했을 때의 값이다. "
+                   "통하지 않은 지시는 두 채점이 같은 발화를 짚었을 때만 셌다.\n")
+        for key in ("prompt", "context", "agentic"):
+            r[key]["shown"] = "{} ({}, {})".format(r[key]["score"], *spread[key])
+    else:
+        for key in ("prompt", "context", "agentic"):
+            r[key]["shown"] = str(r[key]["score"])
     out.append("| 축 | 점수 | 레벨 | 구성 |")
     out.append("|---|---:|:---:|---|")
-    out.append("| Prompt Engineering | {} | {} | {} |".format(
-        p["score"], p["level"], " · ".join("{} {:.1f}".format(DIM_KO[d], v) for d, v in p["dims"].items())))
+    out.append("| Prompt Engineering | {} | {} | 지시 {}개 중 {}개가 한 번에 통함 · 되물음 {} · 오해 {} |".format(
+        p["shown"], p["level"], p["instructions"], p["landed"], p["clarify"], p["misread"]))
     out.append("| Context Engineering | {} | {} | 세션 맥락 {:.2f}/5 · 설정 점검 {}/100 |".format(
-        c["score"], c["level"], c["session_mean"], c["setup_points"]))
-    out.append("| Agentic Engineering | {} | {} | 세션 위임 {:.2f}/5 · 검증된 성공 {} · 프롬프트당 도구 호출 {:.1f} |".format(
-        a["score"], a["level"], a["session_mean"], pct(a["verified_success"]), a["actions_per_prompt"]))
+        c["shown"], c["level"], c["session_mean"], c["setup_points"]))
+    out.append("| Agentic Engineering | {} | {} | 세션 위임 {:.2f}/5 · 검증된 성공 {} |".format(
+        a["shown"], a["level"], a["session_mean"], pct(a["verified_success"])))
     out.append("")
     out.append("## Anthropic 연구 집계와 비교 (참고)\n")
     out.append("Anthropic \"Agentic Coding and Persistent Returns to Expertise\"(2026-06, 약 40만 세션)의 숫자다.\n")
@@ -269,13 +357,23 @@ def render(manifest, r, problems):
     out.append("")
     out.append("## 세션별 점수\n")
     out.append("작업 유형 분포: {}\n".format(", ".join("{} {}".format(k, v) for k, v in r["work_modes"].items())))
-    out.append("| 시작 | 프로젝트 | 유형 | 숙련 | 프롬프트 | 맥락 | 위임 | 결과 | 사람 발화 | 도구 |")
+    out.append("| 시작 | 프로젝트 | 유형 | 숙련 | 통한 지시 | 맥락 | 위임 | 결과 | 사람 발화 | 도구 |")
     out.append("|---|---|---|:---:|:---:|:---:|:---:|---|---:|---:|")
     for s, x in zip(r["rows"], r["scores"]):
-        out.append("| {} | {} | {} | {} | {:.1f} | {} | {} | {}{} | {} | {} |".format(
+        out.append("| {} | {} | {} | {} | {} | {:g} | {:g} | {}{} | {} | {} |".format(
             (s.get("start") or "")[:10], project_name(s), x["work_mode"], x["expertise"],
-            mean(x["prompt"][k] for k in PROMPT_DIMS), x["context"]["score"], x["agentic"]["score"],
+            "{}/{}".format(x["prompt"]["instructions"] - len(x["prompt"]["misses"]), x["prompt"]["instructions"]),
+            x["context"]["score"], x["agentic"]["score"],
             x["outcome"], " ✔" if x["hard_signal"] else "", s["human_turns"], s["tool_calls"]))
+    out.append("")
+    out.append("## 한 번에 통하지 않은 지시\n")
+    out.append("문장 형태 참고 점수(축 점수에 들어가지 않음): {} — {}\n".format(
+        p["form_score"], " · ".join("{} {:.1f}".format(DIM_KO[d], v) for d, v in p["dims"].items())))
+    for s, x in zip(r["rows"], r["scores"]):
+        for m in x["prompt"]["misses"]:
+            out.append("- `{}` {} {} — {}".format(s["id"][:8], m["turn"], MISS_KO[m["kind"]], m["evidence"].strip()[:120]))
+    if not p["clarify"] + p["misread"]:
+        out.append("- 없음")
     out.append("")
     out.append("## 세션별 강점과 보완점\n")
     for s, x in zip(r["rows"], r["scores"]):
@@ -295,23 +393,28 @@ def render(manifest, r, problems):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir")
+    ap.add_argument("--passes", type=int, choices=(1, 2), default=2)
     args = ap.parse_args(argv)
     with open(os.path.join(args.out_dir, "manifest.json"), encoding="utf-8") as fh:
         manifest = json.load(fh)
     with open(os.path.join(args.out_dir, "context_audit.json"), encoding="utf-8") as fh:
         audit = json.load(fh)
-    scores, problems = load_scores(args.out_dir, manifest["sessions"])
-    for sid, errs in sorted(problems.items()):
-        print("needs rescoring: {} ({})".format(sid, ", ".join(errs)))
-    if not scores:
-        print("no valid score files yet")
+    by_pass, problems = load_scores(args.out_dir, manifest["sessions"], args.passes)
+    for name, errs in sorted(problems.items()):
+        print("needs rescoring: {} ({})".format(name, ", ".join(errs)))
+    if not by_pass:
+        print("no complete score sets yet")
         return 2
-    r = compute(manifest, audit, scores)
+    r = compute(manifest, audit, {sid: merge(passes) for sid, passes in by_pass.items()})
+    if args.passes == 2:
+        singles = [compute(manifest, audit, {sid: passes[i] for sid, passes in by_pass.items()}) for i in (0, 1)]
+        r["spread"] = {k: [x[k]["score"] for x in singles] for k in ("prompt", "context", "agentic")}
     report = render(manifest, r, problems)
     with open(os.path.join(args.out_dir, "report.md"), "w", encoding="utf-8") as fh:
         fh.write(report)
     summary = {k: v for k, v in r.items() if k not in ("rows", "scores")}
     summary["context"] = {k: v for k, v in r["context"].items() if k != "setup_rows"}
+    summary["passes"] = args.passes
     summary["unscored"] = sorted(problems)
     with open(os.path.join(args.out_dir, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)

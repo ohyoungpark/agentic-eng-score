@@ -45,22 +45,24 @@ eligible이 5개 미만이면 `--days 90`이나 `--min-turns 2`로 넓히고, �
 python3 "<skill-dir>/scripts/context_audit.py" "<out-dir>"
 ```
 
-### 4. 세션 채점 — 묶음마다 서브에이전트 하나, 한 메시지에서 병렬로
+### 4. 세션 채점 — 묶음마다 서브에이전트 둘, 한 메시지에서 병렬로
 
-묶음마다 `general-purpose` 서브에이전트를 `model: sonnet`으로 띄운다. 모두 한 메시지 안에서 동시에 호출한다. 지시문은 아래 형식을 그대로 쓰고, 꺾쇠 안만 채운다.
+채점자 한 명의 판단은 흔들린다. 그래서 묶음마다 서로 독립된 `general-purpose` 서브에이전트(`model: sonnet`)를 **둘** 띄운다. 첫 번째는 `<session_id>.json`에, 두 번째는 `<session_id>.b.json`에 저장한다. 묶음이 4개면 서브에이전트는 8개이고, 모두 한 메시지 안에서 동시에 호출한다. 지시문은 아래 형식을 그대로 쓰고, 꺾쇠 안만 채운다. `<suffix>`는 첫 번째 채점자에게는 빈 문자열, 두 번째 채점자에게는 `.b`다.
 
 ```text
 너는 Claude Code 세션 채점자다. 먼저 <skill-dir>/rubric.md 를 끝까지 읽어라.
 그다음 아래 transcript를 하나씩 읽고, 세션마다 rubric의 "출력 JSON" 형식 그대로
-<out-dir>/scores/<session_id>.json 파일로 저장하라.
+<out-dir>/scores/<session_id><suffix>.json 파일로 저장하라.
 - <out-dir>/transcripts/<id1>.txt
 - <out-dir>/transcripts/<id2>.txt
 (묶음의 나머지 id)
 세션끼리 점수를 맞추지 말고 rubric 기준으로 하나씩 따로 채점하라.
+scores 폴더에 이미 있는 다른 파일은 읽지 마라.
+인용은 transcript의 한 줄에서 연속된 원문 그대로 가져오고 중간을 줄이지 마라.
 다 저장했으면 "scored: <id 목록>" 한 줄만 답하라.
 ```
 
-서브에이전트를 쓸 수 없는 환경이면 같은 지시를 직접 수행한다.
+서브에이전트를 쓸 수 없는 환경이면 같은 지시를 직접 한 번 수행하고, 5단계에서 `--passes 1`을 붙인다. 사용자가 빨리 보고 싶다고 하면 채점자를 묶음당 하나만 띄우고 `--passes 1`로 합산해도 된다. 이때는 점수가 한 번의 채점이라는 점을 보고에 적는다.
 
 ### 5. 합산
 
@@ -68,7 +70,7 @@ python3 "<skill-dir>/scripts/context_audit.py" "<out-dir>"
 python3 "<skill-dir>/scripts/aggregate.py" "<out-dir>"
 ```
 
-`needs rescoring:` 줄이 나오면 그 세션만 4단계 지시문으로 다시 채점한 뒤 합산을 다시 돌린다. 종료 코드 0이 될 때까지 반복한다.
+`needs rescoring:` 줄이 나오면 거기 적힌 파일만 4단계 지시문으로 다시 채점한 뒤 합산을 다시 돌린다. 종료 코드 0이 될 때까지 반복한다.
 
 ### 6. 총평을 붙이고 보고
 
@@ -87,7 +89,7 @@ python3 "<skill-dir>/scripts/aggregate.py" "<out-dir>"
 | 조사 | `collect.py --survey` | 반복 머리말 목록 |
 | 수집 | `collect.py --exclude-prefix …` | `manifest.json`, `transcripts/*.txt` |
 | 점검 | `context_audit.py <out-dir>` | `context_audit.json` |
-| 채점 | 서브에이전트 (sonnet) | `scores/<id>.json` |
+| 채점 | 서브에이전트 (sonnet) × 2 | `scores/<id>.json`, `scores/<id>.b.json` |
 | 합산 | `aggregate.py <out-dir>` | `report.md`, `summary.json` |
 
 ## 흔한 실수

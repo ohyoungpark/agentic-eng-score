@@ -178,6 +178,7 @@ def new_stats(path):
         "slash_cmds": collections.Counter(),
         "compactions": 0,
         "tool_calls": 0,
+        "human_tool_calls": 0,
         "tools": collections.Counter(),
         "tool_errors": 0,
         "edit_calls": 0,
@@ -198,6 +199,7 @@ def parse_session(path, exclude_prefixes, probes=None):
     s = new_stats(path)
     lines = []
     tool_uses_per_message = collections.Counter()
+    trigger = None  # who caused the work now running: "human" or "automation"
     for e in read_entries(path):
         kind_of_entry = e.get("type")
         if kind_of_entry not in ("user", "assistant") or e.get("isSidechain"):
@@ -226,6 +228,7 @@ def parse_session(path, exclude_prefixes, probes=None):
                         s["tool_errors"] += 1
                         lines.append(("E", block_text(b.get("content"))))
             elif kind == "human":
+                trigger = "human"
                 s["human_turns"] += 1
                 s["human_chars"] += len(text)
                 if e.get("uuid"):
@@ -239,6 +242,7 @@ def parse_session(path, exclude_prefixes, probes=None):
                 s["slash_cmds"][text.split(" ", 1)[0]] += 1
                 lines.append(("/", text))
                 if " " in text:
+                    trigger = "human"
                     s["human_turns"] += 1
                     s["human_chars"] += len(text)
             elif kind == "bang":
@@ -248,6 +252,7 @@ def parse_session(path, exclude_prefixes, probes=None):
                 s["interrupts"] += 1
                 lines.append(("E", "[user interrupted]"))
             elif kind == "automation":
+                trigger = "automation"
                 s["automation_msgs"] += 1
             continue
 
@@ -263,6 +268,8 @@ def parse_session(path, exclude_prefixes, probes=None):
                 name = b.get("name", "?")
                 inp = b.get("input") or {}
                 s["tool_calls"] += 1
+                if trigger == "human":
+                    s["human_tool_calls"] += 1
                 s["tools"][name] += 1
                 tool_uses_per_message[message.get("id")] += 1
                 if name in EDIT_TOOLS:
@@ -357,7 +364,9 @@ def jsonable(s):
     out["mcp_servers"] = sorted(s["mcp_servers"])
     out["tools"] = dict(s["tools"].most_common(20))
     out["slash_cmds"] = dict(s["slash_cmds"])
-    out["actions_per_prompt"] = round(s["tool_calls"] / s["human_turns"], 2) if s["human_turns"] else 0.0
+    # Only tool calls made while working on a human prompt; work triggered by
+    # excluded automation messages does not inflate the ratio.
+    out["actions_per_prompt"] = round(s["human_tool_calls"] / s["human_turns"], 2) if s["human_turns"] else 0.0
     return out
 
 

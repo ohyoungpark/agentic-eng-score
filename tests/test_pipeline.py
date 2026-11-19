@@ -137,7 +137,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((s["subagent_calls"], s["skill_calls"], s["mcp_calls"]), (1, 1, 1))
         self.assertEqual(s["mcp_servers"], ["srv"])
         self.assertEqual(s["parallel_batches"], 1)
-        self.assertEqual(s["actions_per_prompt"], 1.5)
+        # all 6 tool calls follow the excluded bot message, so none count toward a human prompt
+        self.assertEqual((s["human_tool_calls"], s["actions_per_prompt"]), (0, 0.0))
 
     def test_transcript_shows_human_text_without_injections(self):
         self.run_collect()
@@ -176,27 +177,49 @@ class PipelineTest(unittest.TestCase):
             context_audit.main([self.out, "--claude-dir", self.claude, "--claude-json", self.claude_json])
         score = {
             "session_id": "main", "work_mode": "Build", "expertise": 4,
-            "prompt": {"clarity": 8, "specificity": 6, "actionability": 7, "scope": 7, "evidence": "U1"},
+            "prompt": {"instructions": 4, "misses": [{"turn": "U2", "kind": "clarify", "evidence": "Then run the tests"}],
+                       "clarity": 8, "specificity": 6, "actionability": 7, "scope": 7, "evidence": "U1"},
             "context": {"score": 3, "evidence": "U2"}, "agentic": {"score": 4, "evidence": "T"},
             "planning_by_user": "most", "execution_by_user": "few",
-            "outcome": "Succeeded", "hard_signal": True, "strength": "s", "gap": "g",
+            "outcome": "Succeeded", "hard_signal": True, "hard_signal_evidence": "git commit -m 'retry'",
+            "strength": "s", "gap": "g",
         }
         with open(os.path.join(self.out, "scores", "main.json"), "w") as fh:
             json.dump(score, fh)
         with redirect_stdout(io.StringIO()):
-            rc = aggregate.main([self.out])
+            rc = aggregate.main([self.out, "--passes", "1"])
         self.assertEqual(rc, 0)
         with open(os.path.join(self.out, "summary.json")) as fh:
             summary = json.load(fh)
-        self.assertEqual(summary["prompt"]["score"], 70.0)
+        self.assertEqual(summary["prompt"]["score"], 75.0)  # 3 of 4 instructions landed
+        self.assertEqual(summary["prompt"]["form_score"], 70.0)
         # setup: everything but skills_many(5), agents(5), commands_plugins(5) = 85.
         # mcp_many passes on 2 configured (a, b) + 1 called in the session (srv).
         self.assertEqual(summary["context"]["setup_points"], 85)
         self.assertEqual(summary["context"]["score"], 67.5)  # 0.5*50 + 0.5*85
-        self.assertEqual(summary["agentic"]["score"], 69.4)  # 0.7*75 + 0.15*100 + 0.15*12.5
-        self.assertEqual(summary["agentic"]["level"], "L3")
+        self.assertEqual(summary["agentic"]["score"], 80.0)  # 0.8*75 + 0.2*100
+        self.assertEqual(summary["agentic"]["level"], "L4")
+
+        # Second pass disagrees: other missed turn, lower scores, no hard signal.
+        second = json.loads(json.dumps(score))
+        second["prompt"]["misses"] = [{"turn": "U1", "kind": "misread", "evidence": "Add retry with exponential"}]
+        second["context"]["score"], second["agentic"]["score"] = 5, 3
+        second["outcome"], second["hard_signal"], second["hard_signal_evidence"] = "Partial", False, ""
+        with open(os.path.join(self.out, "scores", "main.b.json"), "w") as fh:
+            json.dump(second, fh)
+        with redirect_stdout(io.StringIO()):
+            rc = aggregate.main([self.out])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.out, "summary.json")) as fh:
+            both = json.load(fh)
+        self.assertEqual(both["prompt"]["score"], 100.0)  # no turn flagged by both passes
+        self.assertEqual(both["spread"]["prompt"], [75.0, 75.0])
+        self.assertEqual(both["context"]["session_mean"], 4.0)
+        self.assertEqual(both["agentic"]["score"], 50.0)  # 0.8*62.5 + 0.2*0: Partial wins, no hard signal
         with open(os.path.join(self.out, "report.md")) as fh:
-            self.assertIn("| Prompt Engineering | 70.0 | L3 |", fh.read())
+            report = fh.read()
+        self.assertIn("| Prompt Engineering | 100.0 (75.0, 75.0) | L5 | 지시 4개 중 4개가 한 번에 통함 · 되물음 0 · 오해 0 |", report)
+        self.assertNotIn("U2 되물음", report)  # flagged by one pass only
 
     def test_aggregate_rejects_quotes_missing_from_transcript(self):
         transcript = '[U1] Add retry with exponential backoff to fetch()\n'
@@ -204,6 +227,12 @@ class PipelineTest(unittest.TestCase):
         bad = {"context": {"evidence": 'U2: "please make it idempotent and fast"'}}
         self.assertEqual(aggregate.unverified_quotes(good, transcript), [])
         self.assertEqual(aggregate.unverified_quotes(bad, transcript), ["please make it idempotent and fast"])
+        tagged = {"hard_signal": True, "hard_signal_evidence": 'U1: "Add retry with exponential backoff"'}
+        self.assertEqual(aggregate.unverified_quotes(tagged, transcript), [])
+        fake_signal = {"hard_signal": True, "hard_signal_evidence": "all 42 tests passed"}
+        self.assertEqual(aggregate.unverified_quotes(fake_signal, transcript), ["all 42 tests passed"])
+        fake_miss = {"prompt": {"misses": [{"turn": "U1", "kind": "misread", "evidence": "rewrite everything in Rust"}]}}
+        self.assertEqual(aggregate.unverified_quotes(fake_miss, transcript), ["rewrite everything in Rust"])
 
     def test_aggregate_flags_invalid_scores(self):
         self.run_collect()
@@ -215,7 +244,8 @@ class PipelineTest(unittest.TestCase):
         with redirect_stdout(buf):
             rc = aggregate.main([self.out])
         self.assertEqual(rc, 2)
-        self.assertIn("needs rescoring: main", buf.getvalue())
+        self.assertIn("needs rescoring: main.json", buf.getvalue())
+        self.assertIn("needs rescoring: main.b.json (missing)", buf.getvalue())
         errs = aggregate.validate({"session_id": "main", "expertise": 6, "hard_signal": "yes"}, "main")
         self.assertIn("expertise", errs)
         self.assertIn("hard_signal", errs)
