@@ -9,7 +9,7 @@ description: Use when someone asks to measure, score, or level their own prompt 
 
 **모든 데이터는 이 머신 안에만 둔다.** transcript에 비밀값이 섞여 있을 수 있다. 결과물을 외부 서비스에 올리거나 보내지 않는다.
 
-`<skill-dir>`는 이 스킬이 로드될 때 표시되는 base directory다. 스크립트는 Python 3.8+ 표준 라이브러리만 쓴다.
+`<skill-dir>`는 이 스킬이 로드될 때 표시되는 base directory다. 스크립트는 Python 3.9+ 표준 라이브러리만 쓴다.
 
 ## 절차
 

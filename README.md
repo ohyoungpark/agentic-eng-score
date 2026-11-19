@@ -61,7 +61,7 @@ python3 agentic-eng-score/scripts/collect.py --help
 ## 요구 사항
 
 - Claude Code (서브에이전트 사용 가능 권장)
-- Python 3.8 이상, 표준 라이브러리만 사용
+- Python 3.9 이상, 표준 라이브러리만 사용
 - macOS에서 확인했다(Python 3.9, 3.14). 테스트는 CI에서 Linux로도 돈다. Windows는 확인하지 않았다.
 
 ## 개발
